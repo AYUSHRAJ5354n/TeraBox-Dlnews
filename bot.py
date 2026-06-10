@@ -1,7 +1,6 @@
 import os
 import time
 import asyncio
-import requests
 import subprocess
 from flask import Flask
 from threading import Thread
@@ -13,12 +12,6 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_BASE_URL = "https://terabox-api.mn-bots.workers.dev/download?url="
-
-# Headers to mimic a real browser (Crucial for Terabox)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Referer": "https://www.terabox.com/"
-}
 
 # --- KOYEB TCP HEALTH CHECK ---
 app_health = Flask(__name__)
@@ -32,17 +25,9 @@ def run_health_server():
 # --- BOT CLIENT ---
 bot = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-def check_link(url):
-    """Checks if the API link is ready using browser headers"""
-    try:
-        response = requests.head(url, headers=HEADERS, timeout=10)
-        return response.status_code == 200 or response.status_code == 302
-    except:
-        return False
-
 @bot.on_message(filters.command("start"))
 async def start(client, message):
-    await message.reply_text("✅ **Bot Ready.**\nSend a Terabox link. I will start the download as soon as the API link is live.")
+    await message.reply_text("✅ **Bot Ready (yt-dlp mode).**\nSend a Terabox link. I will wait for the API and then leech the file.")
 
 @bot.on_message(filters.text & ~filters.command(["start"]))
 async def handle_link(client, message: Message):
@@ -50,56 +35,61 @@ async def handle_link(client, message: Message):
     if "terabox" not in url and "1024tera" not in url:
         return
 
-    status = await message.reply_text("🔎 **Link detected.** Testing link status...")
-    file_name = f"video_{int(time.time())}.mp4"
+    status = await message.reply_text("🔎 **Analyzing link...**")
     direct_stream_url = f"{API_BASE_URL}{url}"
+    
+    # yt-dlp specific filename template
+    file_template = f"video_{int(time.time())}.%(ext)s"
+    output_file = ""
 
     try:
         # --- SMART WAIT LOGIC ---
         start_time = time.time()
         max_wait = 5 * 60 
-        link_ready = False
+        ready = False
 
         while time.time() - start_time < max_wait:
-            if check_link(direct_stream_url):
-                link_ready = True
+            # We use yt-dlp --get-url to check if the link is ready
+            check = subprocess.run(['yt-dlp', '--get-url', direct_stream_url], capture_output=True, text=True)
+            if check.returncode == 0:
+                ready = True
                 break
             
-            elapsed = int(time.time() - start_time)
-            remaining = max_wait - elapsed
-            await status.edit(f"⏳ **Link not ready yet.**\nPolling... `{remaining // 60}m {remaining % 60}s` left.")
-            await asyncio.sleep(10)
+            remaining = max_wait - int(time.time() - start_time)
+            await status.edit(f"⏳ **Waiting for API to generate file...**\n`{remaining // 60}m {remaining % 60}s` left.")
+            await asyncio.sleep(15)
 
-        if not link_ready:
-            await status.edit("❌ **Timeout:** Link didn't become active. API might be overloaded.")
+        if not ready:
+            await status.edit("❌ **API Timeout.** The link didn't respond in time.")
             return
 
-        # --- FFMPEG PROCESSING WITH HEADERS ---
-        await status.edit("🚀 **Link Active! Initializing FFmpeg...**")
+        # --- DOWNLOAD USING YT-DLP ---
+        await status.edit("🚀 **Link Ready! Leeching...**")
         
-        # We pass headers to FFmpeg so the server doesn't block it
+        # yt-dlp command to download and auto-fix the video
         cmd = [
-            'ffmpeg',
-            '-headers', f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\n",
-            '-i', direct_stream_url,
-            '-c', 'copy', 
-            '-bsf:a', 'aac_adtstoasc',
-            file_name, '-y'
+            'yt-dlp',
+            '-o', file_template,
+            '--no-playlist',
+            '--merge-output-format', 'mp4',
+            direct_stream_url
         ]
         
-        process = subprocess.run(cmd, capture_output=True, text=True)
+        subprocess.run(cmd, check=True)
 
-        if not os.path.exists(file_name) or os.path.getsize(file_name) == 0:
-            # Capturing the last 200 characters of the error log for debugging
-            error_log = process.stderr[-200:] if process.stderr else "No error log available"
-            await status.edit(f"❌ **FFmpeg Failed.**\nReason: `{error_log}`")
+        # Find the downloaded file (since extension might vary like .mp4 or .mkv)
+        files = [f for f in os.listdir('.') if f.startswith(f"video_{int(start_time)}")]
+        if not files:
+            await status.edit("❌ **Download failed.** yt-dlp could not save the file.")
             return
+        
+        output_file = files[0]
 
         # --- UPLOADING ---
-        await status.edit("📤 **Uploading...**")
+        await status.edit("📤 **Leeching to Telegram...**")
         await message.reply_video(
-            video=file_name,
-            caption="✅ **Downloaded successfully!**",
+            video=output_file,
+            caption="✅ **Leeched Successfully!**",
             supports_streaming=True,
             progress=progress,
             progress_args=(status, "Uploading")
@@ -107,10 +97,10 @@ async def handle_link(client, message: Message):
         await status.delete()
 
     except Exception as e:
-        await status.edit(f"⚠️ **Error:** `{str(e)}`")
+        await status.edit(f"⚠️ **Leech Error:** `{str(e)}`")
     finally:
-        if os.path.exists(file_name):
-            os.remove(file_name)
+        if output_file and os.path.exists(output_file):
+            os.remove(output_file)
 
 async def progress(current, total, status_msg, type_msg):
     try:
