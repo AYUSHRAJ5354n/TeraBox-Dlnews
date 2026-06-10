@@ -14,7 +14,13 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_BASE_URL = "https://terabox-api.mn-bots.workers.dev/download?url="
 
-# --- KOYEB HEALTH CHECK ---
+# Headers to mimic a real browser (Crucial for Terabox)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Referer": "https://www.terabox.com/"
+}
+
+# --- KOYEB TCP HEALTH CHECK ---
 app_health = Flask(__name__)
 @app_health.route('/')
 def health(): return "Bot is Alive", 200
@@ -27,18 +33,16 @@ def run_health_server():
 bot = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 def check_link(url):
-    """Checks if the API link is ready to stream"""
+    """Checks if the API link is ready using browser headers"""
     try:
-        # We use stream=True and a short timeout to check if the link is active 
-        # without downloading the whole file yet.
-        response = requests.get(url, stream=True, timeout=10)
-        return response.status_code == 200
+        response = requests.head(url, headers=HEADERS, timeout=10)
+        return response.status_code == 200 or response.status_code == 302
     except:
         return False
 
 @bot.on_message(filters.command("start"))
 async def start(client, message):
-    await message.reply_text("✅ **Bot Ready.**\nSend a Terabox link. I will monitor the link and start downloading as soon as it's active (Max wait 5 mins).")
+    await message.reply_text("✅ **Bot Ready.**\nSend a Terabox link. I will start the download as soon as the API link is live.")
 
 @bot.on_message(filters.text & ~filters.command(["start"]))
 async def handle_link(client, message: Message):
@@ -46,52 +50,56 @@ async def handle_link(client, message: Message):
     if "terabox" not in url and "1024tera" not in url:
         return
 
-    status = await message.reply_text("🔎 **Link detected.** Checking status...")
+    status = await message.reply_text("🔎 **Link detected.** Testing link status...")
     file_name = f"video_{int(time.time())}.mp4"
     direct_stream_url = f"{API_BASE_URL}{url}"
 
     try:
         # --- SMART WAIT LOGIC ---
         start_time = time.time()
-        max_wait = 5 * 60  # 5 minutes
+        max_wait = 5 * 60 
         link_ready = False
 
         while time.time() - start_time < max_wait:
-            elapsed = int(time.time() - start_time)
-            remaining = max_wait - elapsed
-            
             if check_link(direct_stream_url):
                 link_ready = True
                 break
             
-            await status.edit(f"⏳ **Link not ready yet.**\nPolling API... `{remaining // 60}m {remaining % 60}s` left.\n(Will start immediately when found)")
+            elapsed = int(time.time() - start_time)
+            remaining = max_wait - elapsed
+            await status.edit(f"⏳ **Link not ready yet.**\nPolling... `{remaining // 60}m {remaining % 60}s` left.")
             await asyncio.sleep(10)
 
         if not link_ready:
-            await status.edit("❌ **Timeout:** API did not become ready within 5 minutes. Try again later.")
+            await status.edit("❌ **Timeout:** Link didn't become active. API might be overloaded.")
             return
 
-        # --- FFMPEG PROCESSING ---
-        await status.edit("🚀 **Link Found! Starting Download & Conversion...**")
+        # --- FFMPEG PROCESSING WITH HEADERS ---
+        await status.edit("🚀 **Link Active! Initializing FFmpeg...**")
         
+        # We pass headers to FFmpeg so the server doesn't block it
         cmd = [
-            'ffmpeg', '-i', direct_stream_url,
-            '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
+            'ffmpeg',
+            '-headers', f"User-Agent: {HEADERS['User-Agent']}\r\nReferer: {HEADERS['Referer']}\r\n",
+            '-i', direct_stream_url,
+            '-c', 'copy', 
+            '-bsf:a', 'aac_adtstoasc',
             file_name, '-y'
         ]
         
-        # Run FFmpeg in a sub-process
         process = subprocess.run(cmd, capture_output=True, text=True)
 
         if not os.path.exists(file_name) or os.path.getsize(file_name) == 0:
-            await status.edit("❌ **FFmpeg Error:** Could not capture the stream. The link might have died.")
+            # Capturing the last 200 characters of the error log for debugging
+            error_log = process.stderr[-200:] if process.stderr else "No error log available"
+            await status.edit(f"❌ **FFmpeg Failed.**\nReason: `{error_log}`")
             return
 
         # --- UPLOADING ---
-        await status.edit("📤 **Uploading to Telegram...**")
+        await status.edit("📤 **Uploading...**")
         await message.reply_video(
             video=file_name,
-            caption="✅ **Successfully Processed!**",
+            caption="✅ **Downloaded successfully!**",
             supports_streaming=True,
             progress=progress,
             progress_args=(status, "Uploading")
@@ -112,5 +120,4 @@ async def progress(current, total, status_msg, type_msg):
 
 if __name__ == "__main__":
     Thread(target=run_health_server, daemon=True).start()
-    print("Bot is running...")
     bot.run()
